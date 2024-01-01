@@ -55,8 +55,8 @@ fn is_under_post_limit(
     post_count: usize,
     character_limit: usize,
 ) -> bool {
-    let post_count_length = (post_count as f64).log10().floor() as usize;
-    let post_number_length = (post_number as f64).log10().floor() as usize;
+    let post_count_length = (post_count as f64).log10().ceil() as usize;
+    let post_number_length = (post_number as f64).log10().ceil() as usize;
     let post_length = parse_to_html(text).len();
     // 4 for the space, two braces, and slash
     post_length + post_count_length + post_number_length + 4 <= character_limit
