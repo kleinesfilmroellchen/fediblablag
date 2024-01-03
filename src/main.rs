@@ -276,6 +276,13 @@ fn main() {
     info!("Post options: {:#?}", post_options);
     let post_md_text = remove_frontmatter(&post_md_text);
 
+    // Take CN into account by subtracting it from the actual character limit.
+    let character_limit = character_limit
+        - post_options
+            .content_notice
+            .as_ref()
+            .map_or(0, |cn| cn.len());
+
     let text_sections = split_text(&post_md_text, character_limit);
     debug!(
         "Post lengths: {:?}",
