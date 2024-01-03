@@ -10,10 +10,13 @@ use elefren::prelude::*;
 use env_logger;
 use fancy_regex::Regex;
 use log::debug;
+use log::error;
 use log::info;
+use log::warn;
 use serde::Deserialize;
 use std::env::var;
 use std::env::VarError;
+use std::process::exit;
 use std::sync::OnceLock;
 
 static SPLIT_POINT: OnceLock<Regex> = OnceLock::new();
@@ -120,12 +123,8 @@ fn is_under_post_limit(
 }
 
 /// Split blog post into lists of posts that observe the character limit.
-fn split_text(input: &str) -> Vec<String> {
+fn split_text(input: &str, character_limit: usize) -> Vec<String> {
     let input = input.replace('\r', "");
-    let character_limit = var("character_limit")
-        .expect("character limit environment variable not defined")
-        .parse::<usize>()
-        .expect("character limit environment variable is not an integer");
 
     let expected_post_count =
         ((parse_to_html(&input).len() / character_limit) as f64 * 1.5).ceil() as usize;
@@ -184,11 +183,55 @@ fn create_client() -> Result<Mastodon, VarError> {
     }))
 }
 
+/// RAII guard that will delete all posts created when an error occurs later on.
+struct PostDeleter<'c> {
+    /// List of post IDs
+    posts: Vec<String>,
+    client: &'c Mastodon,
+    is_armed: bool,
+}
+
+impl<'c> PostDeleter<'c> {
+    pub fn new(client: &'c Mastodon) -> Self {
+        Self {
+            posts: Vec::new(),
+            is_armed: true,
+            client,
+        }
+    }
+
+    pub fn add_post(&mut self, id: &str) {
+        self.posts.push(id.into());
+    }
+
+    pub fn disarm(&mut self) {
+        self.is_armed = false;
+    }
+}
+
+impl<'c> Drop for PostDeleter<'c> {
+    fn drop(&mut self) {
+        if !self.is_armed {
+            return;
+        }
+        debug!("Deleting all posts: {:?}", self.posts);
+        for post in &self.posts {
+            let result = self.client.delete_status(&post);
+            match result {
+                Err(why) => warn!("Couldn't delete post {}: {:?}", post, why),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn post_series(
     client: &Mastodon,
     posts: &[String],
     options: &PostOptions,
 ) -> Result<(), elefren::Error> {
+    let mut deleter = PostDeleter::new(client);
+
     let mut last_status = None;
     for post in posts {
         let mut status = StatusBuilder::new();
@@ -208,15 +251,22 @@ fn post_series(
             status.spoiler_text(content_notice);
         }
         let status = client.new_status(status.build()?)?;
+        deleter.add_post(&status.id);
         last_status = Some(status.id);
         info!("Post created: {}", status.uri);
     }
+    deleter.disarm();
     Ok(())
 }
 
 fn main() {
     dotenv::dotenv().ok();
     env_logger::init();
+
+    let character_limit = var("character_limit")
+        .expect("character limit environment variable not defined")
+        .parse::<usize>()
+        .expect("character limit environment variable is not an integer");
 
     let post_file = std::env::args()
         .nth(1)
@@ -226,7 +276,17 @@ fn main() {
     info!("Post options: {:#?}", post_options);
     let post_md_text = remove_frontmatter(&post_md_text);
 
-    let text_sections = split_text(&post_md_text);
+    let text_sections = split_text(&post_md_text, character_limit);
+    debug!(
+        "Post lengths: {:?}",
+        text_sections.iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+
+    if text_sections.iter().any(|t| t.len() > character_limit) {
+        error!("At least one text section is over the character limit, aborting.");
+        exit(1);
+    }
+
     let client = create_client().expect("couldn't connect to instance");
     post_series(&client, &text_sections, &post_options).expect("posting failed");
 }
