@@ -24,3 +24,11 @@ vapid_key=...
 account_authorization_code=...
 access_token=...
 ```
+
+## Per-post configuration
+
+A post can contain a Markdown frontmatter (delineated by three horizontal dashes) containing YAML configuration. The following config keys are supported at the moment (and others are ignored). All keys are optional.
+
+| Key  | Type   | Description                                    |
+| ---- | ------ | ---------------------------------------------- |
+| `cn` | string | Content Notice to attach to all created posts. |

@@ -1,7 +1,9 @@
 #![doc = include_str!("../README.md")]
 #![deny(clippy::all, rustdoc::all, unused, missing_docs)]
+#![allow(unused)]
 
-#[allow(unused)]
+use comrak::Arena;
+use comrak::ListStyleType;
 use comrak::Options;
 use dotenv;
 use elefren::prelude::*;
@@ -9,6 +11,7 @@ use env_logger;
 use fancy_regex::Regex;
 use log::debug;
 use log::info;
+use serde::Deserialize;
 use std::env::var;
 use std::env::VarError;
 use std::sync::OnceLock;
@@ -19,17 +22,71 @@ fn parse_to_html(input: &str) -> String {
     // html parsing is disabled for now
     input.to_string()
 
-    // let mut conversion_options = Options::default();
-    // conversion_options.extension.strikethrough = true;
-    // conversion_options.extension.tagfilter = true;
-    // conversion_options.extension.table = true;
-    // conversion_options.extension.tasklist = true;
-    // conversion_options.extension.footnotes = true;
-    // conversion_options.extension.description_lists = true;
-    // conversion_options.extension.front_matter_delimiter = Some("---".to_owned());
-    // conversion_options.parse.smart = true;
-    // conversion_options.render.unsafe_ = true;
-    // comrak::markdown_to_html(input, &conversion_options)
+    // comrak::markdown_to_html(input, &comrak_options())
+}
+
+fn comrak_options() -> Options {
+    let mut conversion_options = Options::default();
+    conversion_options.extension.strikethrough = true;
+    conversion_options.extension.tagfilter = true;
+    conversion_options.extension.table = true;
+    conversion_options.extension.tasklist = true;
+    conversion_options.extension.footnotes = true;
+    conversion_options.extension.description_lists = true;
+    conversion_options.extension.front_matter_delimiter = Some("---".to_owned());
+    conversion_options.parse.smart = true;
+    conversion_options.render.unsafe_ = true;
+    conversion_options.render.list_style = ListStyleType::Dash;
+    conversion_options.render.escape = true;
+    conversion_options.render.width = usize::MAX;
+    conversion_options
+}
+
+/// User-definable options for a post, specified in the frontmatter.
+#[derive(Deserialize, Default, Debug)]
+struct PostOptions {
+    #[serde(default, rename = "cn")]
+    content_notice: Option<String>,
+}
+
+fn extract_options_from_frontmatter(input: &str) -> PostOptions {
+    let arena = Arena::new();
+    let document = comrak::parse_document(&arena, input, &comrak_options());
+    let frontmatter = document
+        .descendants()
+        .filter_map(|element| match &element.data.borrow().value {
+            comrak::nodes::NodeValue::FrontMatter(text) => Some(
+                // This is a little bit of a hack: remove Carriage Returns because Windows, and then the frontmatter delimiters themselves.
+                text.trim()
+                    .replace('\r', "")
+                    .trim_start_matches("---\n")
+                    .trim_end_matches("\n---")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .next()
+        .unwrap_or_default();
+    serde_yaml::from_str::<PostOptions>(&frontmatter)
+        .ok()
+        .unwrap_or_default()
+}
+
+fn remove_frontmatter(input: &str) -> String {
+    let arena = Arena::new();
+    let document = comrak::parse_document(&arena, input, &comrak_options());
+    for element in document.descendants() {
+        if matches!(
+            &element.data.borrow().value,
+            comrak::nodes::NodeValue::FrontMatter(_)
+        ) {
+            element.detach();
+        }
+    }
+    let mut output = Vec::new();
+    comrak::format_commonmark(document, &comrak_options(), &mut output).unwrap();
+    // More hacks: comrak likes to use escaped exclamation marks for no reason.
+    String::from_utf8_lossy(&output).replace("\\!", "!")
 }
 
 /// Split a piece of text at given indices.
@@ -127,7 +184,11 @@ fn create_client() -> Result<Mastodon, VarError> {
     }))
 }
 
-fn post_series(client: &Mastodon, posts: &[String]) -> Result<(), elefren::Error> {
+fn post_series(
+    client: &Mastodon,
+    posts: &[String],
+    options: &PostOptions,
+) -> Result<(), elefren::Error> {
     let mut last_status = None;
     for post in posts {
         let mut status = StatusBuilder::new();
@@ -142,6 +203,9 @@ fn post_series(client: &Mastodon, posts: &[String]) -> Result<(), elefren::Error
             .content_type("text/plain");
         if let Some(previous_status) = last_status {
             status.in_reply_to(previous_status);
+        }
+        if let Some(content_notice) = &options.content_notice {
+            status.spoiler_text(content_notice);
         }
         let status = client.new_status(status.build()?)?;
         last_status = Some(status.id);
@@ -158,8 +222,11 @@ fn main() {
         .nth(1)
         .expect("first argument must be a markdown file blog post to post");
     let post_md_text = std::fs::read_to_string(post_file).expect("couldn't read post file");
+    let post_options = extract_options_from_frontmatter(&post_md_text);
+    info!("Post options: {:#?}", post_options);
+    let post_md_text = remove_frontmatter(&post_md_text);
 
     let text_sections = split_text(&post_md_text);
     let client = create_client().expect("couldn't connect to instance");
-    post_series(&client, &text_sections).expect("posting failed");
+    post_series(&client, &text_sections, &post_options).expect("posting failed");
 }
